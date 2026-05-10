@@ -1,4 +1,5 @@
 import { uuidv7 } from "uuidv7";
+import { PDFDocument } from "pdf-lib";
 
 declare global {
   interface Window {
@@ -21,8 +22,7 @@ const STABLE_THRESHOLD_PX = 6;
 const MIN_AREA_RATIO = 0.12;          // strict: doc must cover ≥12% of frame
 const MIN_LOOSE_AREA_RATIO = 0.05;    // loose fallback for manual button
 const COOLDOWN_MS = 1500;
-const OUTPUT_MAX_DIM = 1800;
-const JPEG_QUALITY = 0.92;
+const FOCUS_DELAY_MS = 500;           // give camera autofocus time to lock before grabbing frame
 const QUAD_EPSILON_FACTOR = 0.02;     // approxPolyDP epsilon as fraction of perimeter
 const ANGLE_TOLERANCE_DEG = 25;       // reject quads with corners outside 90°±25°
 const SIDE_RATIO_MAX = 4;             // reject quads where opposite sides differ >4×
@@ -88,15 +88,43 @@ async function waitForGlobals() {
 }
 
 async function startCamera() {
+  const videoConstraints: MediaTrackConstraints = {
+    facingMode: { ideal: "environment" },
+    width: { ideal: 3840 },
+    height: { ideal: 2160 },
+    ...({
+      resizeMode: "none",
+      focusMode: "continuous",
+      whiteBalanceMode: "continuous",
+      exposureMode: "continuous",
+      advanced: [
+        { focusMode: "continuous" },
+        { whiteBalanceMode: "continuous" },
+        { exposureMode: "continuous" },
+      ],
+    } as object),
+  };
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode: { ideal: "environment" },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
-    },
+    video: videoConstraints,
     audio: false,
   });
   video.srcObject = stream;
+
+  const track = stream.getVideoTracks()[0];
+  if (track) {
+    try {
+      await track.applyConstraints({
+        advanced: [
+          { focusMode: "continuous" },
+          { whiteBalanceMode: "continuous" },
+          { exposureMode: "continuous" },
+        ],
+      } as unknown as MediaTrackConstraints);
+    } catch {
+      // not all browsers/cameras honor these; ignore
+    }
+  }
+
   await new Promise<void>((resolve) => {
     if (video.readyState >= 2) return resolve();
     video.onloadedmetadata = () => resolve();
@@ -165,8 +193,8 @@ function detectFrame() {
 
   if (stableCount >= STABLE_FRAMES) {
     stableCount = 0;
-    cooldownUntil = Date.now() + COOLDOWN_MS;
-    capture(currentStrict);
+    cooldownUntil = Date.now() + COOLDOWN_MS + FOCUS_DELAY_MS;
+    scheduleCapture(currentStrict);
   } else {
     setHint(`hold steady (${stableCount}/${STABLE_FRAMES})`);
   }
@@ -175,8 +203,17 @@ function detectFrame() {
 function manualCapture() {
   if (Date.now() < cooldownUntil) return;
   const corners = currentStrict ?? currentLoose ?? fullFrameCorners();
-  cooldownUntil = Date.now() + COOLDOWN_MS;
+  cooldownUntil = Date.now() + COOLDOWN_MS + FOCUS_DELAY_MS;
   stableCount = 0;
+  scheduleCapture(corners);
+}
+
+async function scheduleCapture(initialCorners: Corners) {
+  setHint("focusing…");
+  await sleep(FOCUS_DELAY_MS);
+  // detection has been running during the delay against newly-focused frames;
+  // prefer the latest detected corners and fall back to what we had at trigger time.
+  const corners = currentStrict ?? currentLoose ?? initialCorners;
   capture(corners);
 }
 
@@ -368,16 +405,27 @@ function capture(procCorners: Corners) {
 
   flash();
 
-  result.toBlob(
-    (blob) => {
-      if (!blob) return;
-      const id = uuidv7();
-      const filename = `${id}.jpg`;
-      enqueue(blob, filename, result);
-    },
-    "image/jpeg",
-    JPEG_QUALITY,
-  );
+  result.toBlob(async (pngBlob) => {
+    if (!pngBlob) return;
+    const id = uuidv7();
+    try {
+      const pdfBlob = await pngCanvasToPdf(result, pngBlob);
+      enqueue(pdfBlob, `${id}.pdf`, result);
+    } catch (err) {
+      console.error("pdf wrap failed, falling back to png", err);
+      enqueue(pngBlob, `${id}.png`, result);
+    }
+  }, "image/png");
+}
+
+async function pngCanvasToPdf(canvas: HTMLCanvasElement, pngBlob: Blob): Promise<Blob> {
+  const pngBytes = new Uint8Array(await pngBlob.arrayBuffer());
+  const pdf = await PDFDocument.create();
+  const png = await pdf.embedPng(pngBytes);
+  const page = pdf.addPage([canvas.width, canvas.height]);
+  page.drawImage(png, { x: 0, y: 0, width: canvas.width, height: canvas.height });
+  const pdfBytes = await pdf.save();
+  return new Blob([pdfBytes as BlobPart], { type: "application/pdf" });
 }
 
 function enqueue(blob: Blob, filename: string, previewCanvas: HTMLCanvasElement) {
@@ -385,7 +433,7 @@ function enqueue(blob: Blob, filename: string, previewCanvas: HTMLCanvasElement)
   li.dataset.state = "uploading";
 
   const img = document.createElement("img");
-  img.src = previewCanvas.toDataURL("image/jpeg", 0.6);
+  img.src = previewCanvas.toDataURL("image/png");
 
   const meta = document.createElement("div");
   meta.className = "meta";
@@ -546,8 +594,7 @@ function computeOutputSize(c: Corners) {
   const d = (a: Corner, b: Corner) => Math.hypot(a.x - b.x, a.y - b.y);
   const w = (d(c.topLeftCorner, c.topRightCorner) + d(c.bottomLeftCorner, c.bottomRightCorner)) / 2;
   const h = (d(c.topLeftCorner, c.bottomLeftCorner) + d(c.topRightCorner, c.bottomRightCorner)) / 2;
-  const scale = OUTPUT_MAX_DIM / Math.max(w, h);
-  return { width: Math.max(1, Math.round(w * scale)), height: Math.max(1, Math.round(h * scale)) };
+  return { width: Math.max(1, Math.round(w)), height: Math.max(1, Math.round(h)) };
 }
 
 function setHint(text: string) {

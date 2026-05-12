@@ -1,6 +1,15 @@
 import { uuidv7 } from "uuidv7";
 import { PDFDocument } from "pdf-lib";
 
+// Vendor UMD scripts are served by Bun.serve at /vendor/* (see index.ts).
+// Inject them at runtime so the HTML bundler doesn't try to resolve the URLs at build time.
+for (const src of ["/vendor/opencv.js", "/vendor/jscanify.js"]) {
+  const s = document.createElement("script");
+  s.src = src;
+  s.async = true;
+  document.head.appendChild(s);
+}
+
 declare global {
   interface Window {
     cv: any;
@@ -22,7 +31,8 @@ const STABLE_THRESHOLD_PX = 6;
 const MIN_AREA_RATIO = 0.12;          // strict: doc must cover ≥12% of frame
 const MIN_LOOSE_AREA_RATIO = 0.05;    // loose fallback for manual button
 const COOLDOWN_MS = 1500;
-const FOCUS_DELAY_MS = 500;           // give camera autofocus time to lock before grabbing frame
+const FOCUS_DELAY_MS = 300;           // give camera autofocus time to lock before grabbing frame
+const OUTPUT_MIN_LONG_DIM = 3000;     // upscale to this on long side if natural is smaller; ≈256 DPI on A4
 const QUAD_EPSILON_FACTOR = 0.02;     // approxPolyDP epsilon as fraction of perimeter
 const ANGLE_TOLERANCE_DEG = 25;       // reject quads with corners outside 90°±25°
 const SIDE_RATIO_MAX = 4;             // reject quads where opposite sides differ >4×
@@ -39,6 +49,47 @@ if (!captureBtn) {
   console.warn("capture button missing in DOM — hard-reload the page to pick up new HTML");
 }
 
+const modeButtons = document.querySelectorAll<HTMLButtonElement>("#mode-toggle button[data-mode]");
+const draftSection = document.getElementById("draft") as HTMLElement;
+const draftPagesEl = document.getElementById("draft-pages") as HTMLOListElement;
+const draftCountEl = document.getElementById("draft-count") as HTMLSpanElement;
+const confirmGroupBtn = document.getElementById("confirm-group") as HTMLButtonElement;
+
+type Mode = "single" | "group";
+let mode: Mode = "single";
+
+type DraftPage = {
+  id: string;
+  pngBlob: Blob;
+  width: number;
+  height: number;
+  previewUrl: string;
+  liEl: HTMLLIElement;
+};
+let draft: DraftPage[] = [];
+
+function yieldToMain() {
+  // Macrotask yield — lets requestAnimationFrame, input handlers, etc. run between PDF ops.
+  return new Promise<void>((r) => setTimeout(r, 0));
+}
+
+async function buildPdf(
+  pages: { pngBlob: Blob; width: number; height: number }[],
+): Promise<Blob> {
+  const pdf = await PDFDocument.create();
+  for (const p of pages) {
+    const bytes = new Uint8Array(await p.pngBlob.arrayBuffer());
+    await yieldToMain();
+    const png = await pdf.embedPng(bytes);
+    await yieldToMain();
+    const page = pdf.addPage([p.width, p.height]);
+    page.drawImage(png, { x: 0, y: 0, width: p.width, height: p.height });
+    await yieldToMain();
+  }
+  const pdfBytes = await pdf.save();
+  return new Blob([pdfBytes as BlobPart], { type: "application/pdf" });
+}
+
 const overlayCtx = overlay.getContext("2d")!;
 const workCtx = work.getContext("2d", { willReadFrequently: true })!;
 
@@ -52,6 +103,7 @@ let currentLoose: Corners | null = null;
 let prevStableSeed: Corners | null = null;
 let stableCount = 0;
 let cooldownUntil = 0;
+let needsClearFrame = false;          // after a capture, require the frame to clear before re-arming auto
 let inFlightUploads = 0;
 
 setHint("loading scanner…");
@@ -73,7 +125,36 @@ async function main() {
 
   captureBtn?.addEventListener("click", manualCapture);
 
+  modeButtons.forEach((b) =>
+    b.addEventListener("click", () => setMode((b.dataset.mode as Mode) ?? "single")),
+  );
+  confirmGroupBtn.addEventListener("click", confirmGroup);
+  document.addEventListener("keydown", onKeydown);
+
+  updateDraftUI();
   requestAnimationFrame(tick);
+}
+
+function setMode(m: Mode) {
+  mode = m;
+  modeButtons.forEach((b) => {
+    if (b.dataset.mode === m) b.dataset.active = "true";
+    else delete b.dataset.active;
+  });
+}
+
+function onKeydown(e: KeyboardEvent) {
+  if (draft.length === 0) return;
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const t = e.target as HTMLElement | null;
+  if (t) {
+    const tag = t.tagName;
+    if (tag === "BUTTON" || tag === "INPUT" || tag === "TEXTAREA" || t.isContentEditable) {
+      return; // let the focused control handle the key
+    }
+  }
+  e.preventDefault();
+  confirmGroup();
 }
 
 async function waitForGlobals() {
@@ -93,7 +174,6 @@ async function startCamera() {
     width: { ideal: 3840 },
     height: { ideal: 2160 },
     ...({
-      resizeMode: "none",
       focusMode: "continuous",
       whiteBalanceMode: "continuous",
       exposureMode: "continuous",
@@ -133,6 +213,11 @@ async function startCamera() {
 
   const vw = video.videoWidth;
   const vh = video.videoHeight;
+  const settings = track?.getSettings?.();
+  console.log(
+    `[camera] delivered ${vw}×${vh}` +
+      (settings ? ` (settings: ${settings.width}×${settings.height})` : ""),
+  );
 
   overlay.width = vw;
   overlay.height = vh;
@@ -173,14 +258,15 @@ function detectFrame() {
   if (!currentStrict) {
     stableCount = 0;
     prevStableSeed = null;
+    needsClearFrame = false; // frame is clear → re-arm auto trigger
     if (Date.now() > cooldownUntil) {
       setHint(currentLoose ? "tap shutter to confirm" : "point at a document");
     }
     return;
   }
 
-  if (Date.now() < cooldownUntil) {
-    setHint("captured ✓");
+  if (needsClearFrame || Date.now() < cooldownUntil) {
+    setHint(needsClearFrame ? "remove document to re-arm" : "captured ✓");
     return;
   }
 
@@ -194,6 +280,7 @@ function detectFrame() {
   if (stableCount >= STABLE_FRAMES) {
     stableCount = 0;
     cooldownUntil = Date.now() + COOLDOWN_MS + FOCUS_DELAY_MS;
+    needsClearFrame = true;
     scheduleCapture(currentStrict);
   } else {
     setHint(`hold steady (${stableCount}/${STABLE_FRAMES})`);
@@ -205,6 +292,7 @@ function manualCapture() {
   const corners = currentStrict ?? currentLoose ?? fullFrameCorners();
   cooldownUntil = Date.now() + COOLDOWN_MS + FOCUS_DELAY_MS;
   stableCount = 0;
+  needsClearFrame = true;
   scheduleCapture(corners);
 }
 
@@ -401,45 +489,127 @@ function capture(procCorners: Corners) {
   workCtx.drawImage(video, 0, 0, work.width, work.height);
 
   const { width: outW, height: outH } = computeOutputSize(fullCorners);
-  const result: HTMLCanvasElement = scanner.extractPaper(work, outW, outH, fullCorners);
+  const result = extractPaperHQ(work, outW, outH, fullCorners);
 
   flash();
 
   result.toBlob(async (pngBlob) => {
     if (!pngBlob) return;
+    if (mode === "group") {
+      addDraftPage(pngBlob, result);
+      setHint(`page added (${draft.length}) — enter to upload`);
+      return;
+    }
     const id = uuidv7();
+    const thumb = result.toDataURL("image/png");
     try {
-      const pdfBlob = await pngCanvasToPdf(result, pngBlob);
-      enqueue(pdfBlob, `${id}.pdf`, result);
+      const pdfBlob = await buildPdf([
+        { pngBlob, width: result.width, height: result.height },
+      ]);
+      enqueue(pdfBlob, `${id}.pdf`, thumb, 1);
     } catch (err) {
       console.error("pdf wrap failed, falling back to png", err);
-      enqueue(pngBlob, `${id}.png`, result);
+      enqueue(pngBlob, `${id}.png`, thumb, 1);
     }
   }, "image/png");
 }
 
-async function pngCanvasToPdf(canvas: HTMLCanvasElement, pngBlob: Blob): Promise<Blob> {
-  const pngBytes = new Uint8Array(await pngBlob.arrayBuffer());
-  const pdf = await PDFDocument.create();
-  const png = await pdf.embedPng(pngBytes);
-  const page = pdf.addPage([canvas.width, canvas.height]);
-  page.drawImage(png, { x: 0, y: 0, width: canvas.width, height: canvas.height });
-  const pdfBytes = await pdf.save();
-  return new Blob([pdfBytes as BlobPart], { type: "application/pdf" });
-}
+function addDraftPage(pngBlob: Blob, previewCanvas: HTMLCanvasElement) {
+  const id = uuidv7();
+  const previewUrl = previewCanvas.toDataURL("image/png");
 
-function enqueue(blob: Blob, filename: string, previewCanvas: HTMLCanvasElement) {
   const li = document.createElement("li");
-  li.dataset.state = "uploading";
+  li.dataset.id = id;
 
   const img = document.createElement("img");
-  img.src = previewCanvas.toDataURL("image/png");
+  img.src = previewUrl;
 
   const meta = document.createElement("div");
   meta.className = "meta";
   const name = document.createElement("div");
   name.className = "name";
-  name.textContent = filename;
+  name.textContent = `page ${draft.length + 1}`;
+  meta.appendChild(name);
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "delete";
+  del.title = "Remove page";
+  del.textContent = "✕";
+  del.addEventListener("click", () => removeDraftPage(id));
+
+  li.append(img, meta, del);
+  draftPagesEl.appendChild(li);
+
+  draft.push({
+    id,
+    pngBlob,
+    width: previewCanvas.width,
+    height: previewCanvas.height,
+    previewUrl,
+    liEl: li,
+  });
+  updateDraftUI();
+}
+
+function removeDraftPage(id: string) {
+  const idx = draft.findIndex((p) => p.id === id);
+  if (idx < 0) return;
+  const [removed] = draft.splice(idx, 1);
+  removed?.liEl.remove();
+  draft.forEach((p, i) => {
+    const nameEl = p.liEl.querySelector(".name");
+    if (nameEl) nameEl.textContent = `page ${i + 1}`;
+  });
+  updateDraftUI();
+}
+
+function updateDraftUI() {
+  const n = draft.length;
+  draftSection.hidden = n === 0;
+  draftCountEl.textContent = `${n} page${n === 1 ? "" : "s"}`;
+  confirmGroupBtn.disabled = n === 0;
+  confirmGroupBtn.textContent = n > 0 ? `Upload group (${n})` : "Upload group";
+}
+
+async function confirmGroup() {
+  if (draft.length === 0) return;
+  const pages = draft.slice();
+  draft = [];
+  draftPagesEl.replaceChildren();
+  updateDraftUI();
+
+  const id = uuidv7();
+  const filename = `${id}.pdf`;
+  const thumb = pages[0]!.previewUrl;
+
+  try {
+    const blob = await buildPdf(
+      pages.map((p) => ({ pngBlob: p.pngBlob, width: p.width, height: p.height })),
+    );
+    enqueue(blob, filename, thumb, pages.length);
+  } catch (err) {
+    console.error("group pdf build failed", err);
+    // restore draft so the user doesn't lose the captures
+    draft = pages;
+    for (const p of pages) draftPagesEl.appendChild(p.liEl);
+    updateDraftUI();
+    setHint(`group upload failed: ${(err as Error).message ?? err}`);
+  }
+}
+
+function enqueue(blob: Blob, filename: string, thumbSrc: string, pageCount = 1) {
+  const li = document.createElement("li");
+  li.dataset.state = "uploading";
+
+  const img = document.createElement("img");
+  img.src = thumbSrc;
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const name = document.createElement("div");
+  name.className = "name";
+  name.textContent = pageCount > 1 ? `${filename} · ${pageCount} pages` : filename;
   const status = document.createElement("div");
   status.className = "status";
   status.textContent = "uploading…";
@@ -594,7 +764,60 @@ function computeOutputSize(c: Corners) {
   const d = (a: Corner, b: Corner) => Math.hypot(a.x - b.x, a.y - b.y);
   const w = (d(c.topLeftCorner, c.topRightCorner) + d(c.bottomLeftCorner, c.bottomRightCorner)) / 2;
   const h = (d(c.topLeftCorner, c.bottomLeftCorner) + d(c.topRightCorner, c.bottomRightCorner)) / 2;
-  return { width: Math.max(1, Math.round(w)), height: Math.max(1, Math.round(h)) };
+  const long = Math.max(w, h);
+  // Keep natural size if the doc is already big; upscale small captures via Lanczos to a quality floor.
+  const scale = long > 0 && long < OUTPUT_MIN_LONG_DIM ? OUTPUT_MIN_LONG_DIM / long : 1;
+  return {
+    width: Math.max(1, Math.round(w * scale)),
+    height: Math.max(1, Math.round(h * scale)),
+  };
+}
+
+function extractPaperHQ(
+  srcCanvas: HTMLCanvasElement,
+  outW: number,
+  outH: number,
+  corners: Corners,
+): HTMLCanvasElement {
+  const out = document.createElement("canvas");
+  out.width = outW;
+  out.height = outH;
+
+  const src = cv.imread(srcCanvas);
+  const dst = new cv.Mat();
+  const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    corners.topLeftCorner.x, corners.topLeftCorner.y,
+    corners.topRightCorner.x, corners.topRightCorner.y,
+    corners.bottomLeftCorner.x, corners.bottomLeftCorner.y,
+    corners.bottomRightCorner.x, corners.bottomRightCorner.y,
+  ]);
+  const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    0, 0,
+    outW, 0,
+    0, outH,
+    outW, outH,
+  ]);
+  let M: any = null;
+  try {
+    M = cv.getPerspectiveTransform(srcTri, dstTri);
+    cv.warpPerspective(
+      src,
+      dst,
+      M,
+      new cv.Size(outW, outH),
+      cv.INTER_LANCZOS4,
+      cv.BORDER_CONSTANT,
+      new cv.Scalar(),
+    );
+    cv.imshow(out, dst);
+    return out;
+  } finally {
+    if (M && typeof M.delete === "function") M.delete();
+    srcTri.delete();
+    dstTri.delete();
+    src.delete();
+    dst.delete();
+  }
 }
 
 function setHint(text: string) {

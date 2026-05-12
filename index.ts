@@ -3,6 +3,17 @@ import index from "./index.html";
 const PAPERLESS_URL = process.env.PAPERLESS_URL;
 const PAPERLESS_TOKEN = process.env.PAPERLESS_TOKEN;
 
+const opencvFile = Bun.file(
+  new URL(
+    "./node_modules/@techstark/opencv-js/dist/opencv.js",
+    import.meta.url,
+  ),
+);
+const jscanifyFile = Bun.file(
+  new URL("./node_modules/jscanify/src/jscanify.js", import.meta.url),
+);
+const JS_HEADERS = { "content-type": "application/javascript; charset=utf-8" };
+
 if (!PAPERLESS_URL || !PAPERLESS_TOKEN) {
   console.error("Missing PAPERLESS_URL / PAPERLESS_TOKEN — set them in .env");
   process.exit(1);
@@ -27,30 +38,57 @@ const server = Bun.serve({
   routes: {
     "/": index,
 
+    "/vendor/opencv.js": new Response(opencvFile, { headers: JS_HEADERS }),
+    "/vendor/jscanify.js": new Response(jscanifyFile, { headers: JS_HEADERS }),
+
     "/api/upload": {
       POST: async (req) => {
-        const incoming = await req.formData();
-        const file = incoming.get("document");
-        if (!(file instanceof File)) {
-          return Response.json({ error: "missing 'document' file" }, { status: 400 });
+        const contentType = req.headers.get("content-type");
+        if (!contentType?.startsWith("multipart/form-data")) {
+          return Response.json(
+            { error: "expected multipart/form-data" },
+            { status: 400 },
+          );
         }
 
-        const out = new FormData();
-        out.append("document", file, file.name);
-        const title = incoming.get("title");
-        if (typeof title === "string") out.append("title", title);
+        const contentLength = req.headers.get("content-length");
+        const headers: Record<string, string> = {
+          Authorization: `Token ${PAPERLESS_TOKEN}`,
+          "content-type": contentType,
+        };
+        if (contentLength) headers["content-length"] = contentLength;
 
         const t0 = performance.now();
-        const upstream = await fetch(`${PAPERLESS_URL}/api/documents/post_document/`, {
-          method: "POST",
-          headers: { Authorization: `Token ${PAPERLESS_TOKEN}` },
-          body: out,
-        });
+        let upstream: Response;
+        try {
+          upstream = await fetch(`${PAPERLESS_URL}/api/documents/post_document/`, {
+            method: "POST",
+            headers,
+            body: req.body,
+            // @ts-expect-error — required by spec for streamed request bodies; Bun accepts it.
+            duplex: "half",
+          });
+        } catch (err: any) {
+          const ms = Math.round(performance.now() - t0);
+          console.error(
+            `[upload] upstream fetch failed after ${ms} ms (${contentLength ?? "?"} B):`,
+            err,
+          );
+          return Response.json(
+            {
+              error: "upstream connection failed",
+              detail: String(err?.message ?? err),
+              code: err?.code,
+            },
+            { status: 502 },
+          );
+        }
+
         const body = await upstream.text();
         const ms = Math.round(performance.now() - t0);
 
         console.log(
-          `[upload] ${file.name} → ${upstream.status} (${file.size} B, ${ms} ms)`,
+          `[upload] → ${upstream.status} (${contentLength ?? "?"} B, ${ms} ms)`,
         );
 
         return new Response(body, {

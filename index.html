@@ -5,8 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
     <title>quickscan</title>
     <link rel="stylesheet" href="./styles.css" />
-    <script async src="https://docs.opencv.org/4.10.0/opencv.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/jscanify@1.3.0/src/jscanify.js"></script>
   </head>
   <body>
     <main>
@@ -21,9 +19,23 @@
 
       <aside id="side">
         <header>
-          <h1>quickscan</h1>
-          <span id="conn-state">booting</span>
+          <div class="head-top">
+            <h1>quickscan</h1>
+            <span id="conn-state">booting</span>
+          </div>
+          <div id="mode-toggle" role="group" aria-label="Capture mode">
+            <button type="button" data-mode="single" data-active="true">Single</button>
+            <button type="button" data-mode="group">Group</button>
+          </div>
         </header>
+        <section id="draft" hidden>
+          <div class="draft-head">
+            <span class="draft-title">Group draft</span>
+            <span id="draft-count" class="draft-count">0 pages</span>
+          </div>
+          <ol id="draft-pages"></ol>
+          <button type="button" id="confirm-group" disabled>Upload group</button>
+        </section>
         <ol id="queue"></ol>
         <footer>
           <button id="capture" type="button">Capture</button>

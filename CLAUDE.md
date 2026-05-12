@@ -1,4 +1,10 @@
 
+## Dependencies
+
+**Never load runtime dependencies from a CDN** (jsdelivr, unpkg, docs.opencv.org, etc.). Every JS/CSS dependency must be installed via `bun add` at an **exact** version (no `^`, no `~`, no `latest`) and pinned in `package.json`. For browser-side scripts that need to be available as plain `<script>` tags (e.g. UMD libraries like OpenCV.js, jscanify), serve them from `node_modules` through a route in `Bun.serve` (see the `/vendor/*` routes in `index.ts`) and reference that local URL from `index.html`. This keeps builds reproducible and removes runtime dependencies on third-party hosts.
+
+## Bun
+
 Default to using Bun instead of Node.js.
 
 - Use `bun <file>` instead of `node <file>` or `ts-node <file>`

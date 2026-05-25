@@ -9,8 +9,8 @@ const opencvFile = Bun.file(
     import.meta.url,
   ),
 );
-const jscanifyFile = Bun.file(
-  new URL("./node_modules/jscanify/src/jscanify.js", import.meta.url),
+const pdfLibFile = Bun.file(
+  new URL("./node_modules/pdf-lib/dist/pdf-lib.min.js", import.meta.url),
 );
 const JS_HEADERS = { "content-type": "application/javascript; charset=utf-8" };
 
@@ -18,6 +18,18 @@ if (!PAPERLESS_URL || !PAPERLESS_TOKEN) {
   console.error("Missing PAPERLESS_URL / PAPERLESS_TOKEN — set them in .env");
   process.exit(1);
 }
+
+const workerBuild = await Bun.build({
+  entrypoints: [new URL("./frontend.worker.ts", import.meta.url).pathname],
+  target: "browser",
+  format: "iife",
+  minify: process.env.NODE_ENV === "production",
+});
+if (!workerBuild.success) {
+  console.error("worker build failed:", workerBuild.logs);
+  process.exit(1);
+}
+const workerJs = await workerBuild.outputs[0]!.text();
 
 async function resolveTaskToDocument(taskId: string): Promise<number | null> {
   const url = `${PAPERLESS_URL}/api/tasks/?task_id=${encodeURIComponent(taskId)}`;
@@ -39,7 +51,8 @@ const server = Bun.serve({
     "/": index,
 
     "/vendor/opencv.js": new Response(opencvFile, { headers: JS_HEADERS }),
-    "/vendor/jscanify.js": new Response(jscanifyFile, { headers: JS_HEADERS }),
+    "/vendor/pdf-lib.js": new Response(pdfLibFile, { headers: JS_HEADERS }),
+    "/vendor/frontend.worker.js": new Response(workerJs, { headers: JS_HEADERS }),
 
     "/api/upload": {
       POST: async (req) => {
